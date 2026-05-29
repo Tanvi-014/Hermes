@@ -15,10 +15,16 @@
             <span class="logo-badge">v1.0.0</span>
         </div>
         <div class="header-actions">
+            <div class="project-switcher" id="project-switcher">
+                <select id="project-select" class="project-select">
+                    <option value="">Loading projects...</option>
+                </select>
+            </div>
             <div class="status-indicator">
                 <span class="status-dot"></span>
                 <span>Active worker pool connected</span>
             </div>
+            <button class="btn btn-secondary btn-sm" id="logout-btn">Logout</button>
         </div>
     </header>
 
@@ -47,6 +53,14 @@
             <button class="filter-btn" data-status="failed">
                 <span>Failed (DLQ)</span>
                 <span class="badge-count" id="count-failed">0</span>
+            </button>
+            <div class="sidebar-divider"></div>
+            <h3 class="sidebar-title">Configuration</h3>
+            <button class="nav-btn" id="nav-projects-btn">
+                <span>Projects</span>
+            </button>
+            <button class="nav-btn" id="nav-alerts-btn">
+                <span>Alert Settings</span>
             </button>
         </div>
 
@@ -95,6 +109,167 @@
                         <!-- Filled by Javascript dynamically -->
                     </tbody>
                 </table>
+            </div>
+        </div>
+
+        <!-- Projects Settings Area (Hidden by default) -->
+        <div class="projects-settings-content" id="projects-settings-content" style="display: none;">
+            <div class="settings-header">
+                <div>
+                    <h1 class="settings-title">Projects</h1>
+                    <p class="settings-subtitle">Manage your projects and team members.</p>
+                </div>
+                <button class="btn btn-secondary" id="back-to-console-from-projects-btn">
+                    &larr; Back to Console
+                </button>
+            </div>
+
+            <div class="settings-grid">
+                <!-- Left Column: Create Project -->
+                <div class="settings-card">
+                    <h3 class="card-title">Create New Project</h3>
+                    <form id="create-project-form" class="alert-form">
+                        <div class="form-group">
+                            <label for="project-name">Project Name</label>
+                            <input type="text" id="project-name" placeholder="e.g. Production Webhooks" required>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Create Project</button>
+                    </form>
+                </div>
+
+                <!-- Right Column: Projects List -->
+                <div class="settings-card">
+                    <h3 class="card-title">Your Projects</h3>
+                    <div class="projects-list" id="projects-list">
+                        <!-- Loaded dynamically -->
+                        <div class="empty-state">Loading projects...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Team Members Section -->
+            <div class="settings-card" id="team-members-card" style="display: none;">
+                <div class="configured-card-header">
+                    <h3 class="card-title">Team Members</h3>
+                    <span class="mono" id="team-project-name" style="color: var(--text-secondary);"></span>
+                </div>
+                
+                <!-- Add Member Form -->
+                <form id="add-member-form" class="alert-form" style="margin-bottom: 20px;">
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label for="member-email">Email</label>
+                            <input type="email" id="member-email" placeholder="colleague@example.com" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="member-role">Role</label>
+                            <select id="member-role" required>
+                                <option value="viewer">Viewer</option>
+                                <option value="admin">Admin</option>
+                                <option value="owner">Owner</option>
+                            </select>
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Add Member</button>
+                </form>
+
+                <div class="team-members-list" id="team-members-list">
+                    <!-- Loaded dynamically -->
+                    <div class="empty-state">Select a project to view team members.</div>
+                </div>
+            </div>
+        </div>
+            </div>
+        </div>
+
+        <!-- Alerts Settings Area (Hidden by default) -->
+        <div class="alerts-settings-content" id="alerts-settings-content" style="display: none;">
+            <div class="settings-header">
+                <div>
+                    <h1 class="settings-title">Alert Settings</h1>
+                    <p class="settings-subtitle">Configure notification channels to alert your team when webhooks enter the Dead Letter Queue (DLQ).</p>
+                </div>
+                <button class="btn btn-secondary" id="back-to-console-btn">
+                    &larr; Back to Console
+                </button>
+            </div>
+
+            <div class="settings-grid">
+                <!-- Left Column: Add New Channel -->
+                <div class="settings-card">
+                    <h3 class="card-title">Add Alert Destination</h3>
+                    
+                    <!-- Channel Type Selector Tabs -->
+                    <div class="channel-tabs">
+                        <button class="channel-tab-btn active" data-channel="slack">Slack Webhook</button>
+                        <button class="channel-tab-btn" data-channel="email">Email (SMTP)</button>
+                    </div>
+
+                    <!-- Slack Form -->
+                    <form id="slack-alert-form" class="alert-form active">
+                        <div class="form-group">
+                            <label for="slack-name">Destination Name</label>
+                            <input type="text" id="slack-name" placeholder="e.g. #ops-alerts" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="slack-webhook-url">Slack Webhook URL</label>
+                            <input type="url" id="slack-webhook-url" placeholder="https://hooks.slack.com/services/..." required>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Save Destination</button>
+                    </form>
+
+                    <!-- Email Form -->
+                    <form id="email-alert-form" class="alert-form">
+                        <div class="form-group">
+                            <label for="email-name">Destination Name</label>
+                            <input type="text" id="email-name" placeholder="e.g. Team Inbox" required>
+                        </div>
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="email-smtp-host">SMTP Host</label>
+                                <input type="text" id="email-smtp-host" placeholder="smtp.mailgun.org" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="email-smtp-port">SMTP Port</label>
+                                <input type="number" id="email-smtp-port" placeholder="587" value="587" required>
+                            </div>
+                        </div>
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="email-from">From Email</label>
+                                <input type="email" id="email-from" placeholder="hermes@company.com" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="email-to">To Email</label>
+                                <input type="email" id="email-to" placeholder="alerts@company.com" required>
+                            </div>
+                        </div>
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="email-username">SMTP User (Optional)</label>
+                                <input type="text" id="email-username" placeholder="postmaster@domain.com">
+                            </div>
+                            <div class="form-group">
+                                <label for="email-password">SMTP Password (Optional)</label>
+                                <input type="password" id="email-password" placeholder="••••••••">
+                            </div>
+                        </div>
+                        <div class="form-checkbox-group">
+                            <input type="checkbox" id="email-use-tls" checked>
+                            <label for="email-use-tls">Use Secure TLS / STARTTLS</label>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Save Destination</button>
+                    </form>
+                </div>
+
+                <!-- Right Column: Configured Channels -->
+                <div class="settings-card">
+                    <h3 class="card-title">Configured Destinations</h3>
+                    <div class="configured-channels-list" id="configured-channels-list">
+                        <!-- Loaded dynamically -->
+                        <div class="empty-state">No alert destinations configured yet. Configure one on the left to start receiving alerts.</div>
+                    </div>
+                </div>
             </div>
         </div>
 

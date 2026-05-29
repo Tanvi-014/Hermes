@@ -45,3 +45,30 @@ class DashboardStats(BaseModel):
     completed_count: int
     failed_count: int  # DLQ
     success_rate: float
+
+
+class AlertConfigCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    channel_type: str = Field(..., pattern="^(slack|email)$")
+    config: Dict[str, Any]
+    enabled: Optional[bool] = True
+
+
+class AlertConfigUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    config: Optional[Dict[str, Any]] = None
+    enabled: Optional[bool] = None
+
+
+class AlertConfigResponse(BaseModel):
+    id: UUID
+    tenant_id: str
+    name: str
+    channel_type: str
+    config: Dict[str, Any]
+    enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+

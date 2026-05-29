@@ -197,6 +197,45 @@ uvicorn app.main:app --reload
 - Built a full developer console with live polling and detailed delivery inspection.
 - Added production-minded controls including API key enforcement, destination validation, idempotency, structured logs, metrics, config templates, tests, and CI.
 
+## Integrations
+
+Hermes works seamlessly with popular webhook providers. See detailed integration guides:
+
+- [Stripe Integration](docs/STRIPE_INTEGRATION.md) — Forward Stripe payment events with signature verification
+- [GitHub Integration](docs/GITHUB_INTEGRATION.md) — Handle repository webhooks with HMAC verification
+
+### Quick Integration Examples
+
+**Stripe Webhook:**
+```bash
+curl -X POST https://hermes.example.com/api/v1/ingest \
+  -H "X-Hermes-API-Key: your-api-key" \
+  -d '{
+    "url": "https://your-app.com/stripe-webhook",
+    "signature_provider": "stripe"
+  }'
+```
+
+**GitHub Webhook:**
+```bash
+curl -X POST https://hermes.example.com/api/v1/ingest \
+  -H "X-Hermes-API-Key: your-api-key" \
+  -d '{
+    "url": "https://your-app.com/github-webhook",
+    "signature_provider": "github"
+  }'
+```
+
+**Fan-out to Multiple Destinations:**
+```bash
+curl -X POST https://hermes.example.com/api/v1/ingest \
+  -H "X-Hermes-API-Key: your-api-key" \
+  -d '{
+    "url": "https://primary.example.com/webhook",
+    "urls": ["https://analytics.example.com/webhook", "https://slack.example.com/webhook"]
+  }'
+```
+
 ## Interview Pitch
 
 Hermes is a self-hosted webhook reliability layer. It accepts webhook events quickly, verifies optional provider signatures, persists them in PostgreSQL, fans out events to multiple destinations, filters and reshapes payloads, safely distributes delivery work across concurrent async workers using `SKIP LOCKED`, retries failed deliveries with exponential backoff, preserves dead-lettered events for inspection, and exposes replay, usage metrics, structured logs, and a dashboard for operations.

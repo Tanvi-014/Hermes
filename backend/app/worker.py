@@ -7,6 +7,7 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.alerts import dispatch_dlq_alert
 from app.config import settings
 from app.db import async_session
 from app.logging_config import configure_logging
@@ -271,6 +272,27 @@ class WebhookWorker:
                         "id": webhook_id
                     }
                 )
+
+                # Fire DLQ alerts to all configured channels for this tenant
+                try:
+                    await dispatch_dlq_alert(
+                        session=session,
+                        tenant_id=tenant_id,
+                        webhook_id=str(webhook_id),
+                        event_id=event_id,
+                        destination_url=destination_url,
+                        retry_count=new_retry_count,
+                        last_error=error_message,
+                    )
+                except Exception as alert_err:
+                    logger.error(
+                        "Failed to dispatch DLQ alerts.",
+                        extra={
+                            "event": "alert.dispatch_error",
+                            "webhook_id": str(webhook_id),
+                            "error": str(alert_err),
+                        },
+                    )
         
         await session.commit()
 

@@ -1,0 +1,45 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "backend/Dockerfile"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 100
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+[[services]]
+name = "hermes"
+memory = "512"
+cpu = "0.5"
+
+[[services.ports]]
+port = 8000
+type = "HTTP"
+
+[[services.env]]
+key = "DATABASE_URL"
+value = "${{Postgres.DATABASE_URL}}"
+
+[[services.env]]
+key = "SYNC_DATABASE_URL"
+value = "${{Postgres.DATABASE_URL}}"
+
+[[services.env]]
+key = "JWT_SECRET"
+generate = "true"
+
+[[services.env]]
+key = "AUTO_CREATE_TABLES"
+value = "false"
+
+[[services.env]]
+key = "WORKER_CONCURRENCY"
+value = "5"
+
+[[services.env]]
+key = "ALLOW_PRIVATE_DESTINATIONS"
+value = "false"
+
+[Postgres]
+name = "hermes-db"

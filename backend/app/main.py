@@ -4,7 +4,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 from uuid import UUID
-from fastapi import FastAPI, Depends, HTTPException, Query, Request, Response, status
+from fastapi import FastAPI, Depends, HTTPException, Query, Request, Response, status, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, func, desc
@@ -12,14 +12,33 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
 from app.db import get_db, init_db
+from app.rate_limit import check_rate_limit
 from app.logging_config import configure_logging
-from app.models import Webhook, WebhookStatus, DeliveryAttempt
+from app.models import Webhook, WebhookStatus, DeliveryAttempt, AlertConfig, User, Project, ProjectMember
+from app.auth import (
+    get_password_hash,
+    verify_password,
+    create_access_token,
+    get_current_user,
+    get_current_active_project,
+    require_project_role,
+    get_tenant_from_auth,
+)
 from app.routing import apply_transform, event_matches_filter, extract_event_id
-from app.schemas import WebhookResponse, WebhookDetailResponse, DashboardStats
+from app.schemas import (
+    WebhookResponse,
+    WebhookDetailResponse,
+    DashboardStats,
+    AlertConfigCreate,
+    AlertConfigUpdate,
+    AlertConfigResponse,
+)
 from app.security import require_api_key, validate_destination_url
 from app.signatures import verify_webhook_signature
 from app.worker import WorkerPool
+from app.alerts import _send_slack_alert, _send_email_alert
 
 configure_logging()
 logger = logging.getLogger("hermes.api")
@@ -65,6 +84,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# HTTPS enforcement middleware (production only)
+if settings.FORCE_HTTPS:
+    app.add_middleware(HTTPSRedirectMiddleware)
+
 # Headers to filter out during ingestion to prevent downstreams from getting confused
 EXCLUDED_INGEST_HEADERS = {
     "host",
@@ -86,8 +109,9 @@ async def ingest_webhook(
     filter_expression: Optional[str] = Query(None, alias="filter", description="Simple filter, for example event.type == 'payment.succeeded'"),
     transform: Optional[str] = Query(None, description="JSON object mapping output fields to source paths"),
     signature_provider: Optional[str] = Query(None, description="Optional signature provider: stripe, github, or hermes"),
-    tenant_id: str = Depends(require_api_key),
-    db: AsyncSession = Depends(get_db)
+    tenant_id: str = Depends(get_tenant_from_auth),
+    db: AsyncSession = Depends(get_db),
+    _rate_limit: None = Depends(lambda: check_rate_limit(request, tenant_id))
 ):
     """
     Generic ingestion endpoint. Accepts any headers and body, writes immediately
@@ -251,7 +275,7 @@ async def list_webhooks(
     status_filter: Optional[str] = Query(None, alias="status"),
     page: int = Query(1, ge=1),
     limit: int = Query(25, ge=1, le=100),
-    tenant_id: str = Depends(require_api_key),
+    tenant_id: str = Depends(get_tenant_from_auth),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -296,7 +320,7 @@ async def list_webhooks(
 @app.get("/api/v1/webhooks/{webhook_id}", response_model=WebhookDetailResponse)
 async def get_webhook_details(
     webhook_id: UUID,
-    tenant_id: str = Depends(require_api_key),
+    tenant_id: str = Depends(get_tenant_from_auth),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -319,7 +343,7 @@ async def get_webhook_details(
 @app.post("/api/v1/webhooks/{webhook_id}/replay")
 async def replay_webhook(
     webhook_id: UUID,
-    tenant_id: str = Depends(require_api_key),
+    tenant_id: str = Depends(get_tenant_from_auth),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -358,7 +382,7 @@ async def replay_webhook(
 
 @app.get("/api/v1/stats", response_model=DashboardStats)
 async def get_stats(
-    tenant_id: str = Depends(require_api_key),
+    tenant_id: str = Depends(get_tenant_from_auth),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -389,7 +413,7 @@ async def get_stats(
 
 @app.get("/metrics")
 async def get_metrics(
-    tenant_id: str = Depends(require_api_key),
+    tenant_id: str = Depends(get_tenant_from_auth),
     db: AsyncSession = Depends(get_db)
 ):
     tenant_filter = Webhook.tenant_id == tenant_id if settings.api_key_tenants else True
@@ -424,7 +448,7 @@ async def get_metrics(
 
 @app.get("/api/v1/usage")
 async def get_usage(
-    tenant_id: str = Depends(require_api_key),
+    tenant_id: str = Depends(get_tenant_from_auth),
     db: AsyncSession = Depends(get_db)
 ):
     stmt = (
@@ -451,9 +475,642 @@ async def get_usage(
         ]
     }
 
+@app.get("/api/v1/alerts", response_model=List[AlertConfigResponse])
+async def list_alerts(
+    tenant_id: str = Depends(get_tenant_from_auth),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Retrieve all alert configurations scoped to the active tenant.
+    """
+    tenant_filter = AlertConfig.tenant_id == tenant_id if settings.api_key_tenants else True
+    stmt = select(AlertConfig).where(tenant_filter).order_by(desc(AlertConfig.created_at))
+    result = await db.execute(stmt)
+    configs = result.scalars().all()
+    return [c.to_dict() for c in configs]
+
+@app.post("/api/v1/alerts", response_model=AlertConfigResponse, status_code=status.HTTP_201_CREATED)
+async def create_alert(
+    config_in: AlertConfigCreate,
+    tenant_id: str = Depends(get_tenant_from_auth),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Create a new alert configuration for the active tenant.
+    """
+    config = AlertConfig(
+        tenant_id=tenant_id,
+        name=config_in.name,
+        channel_type=config_in.channel_type,
+        config=config_in.config,
+        enabled=config_in.enabled if config_in.enabled is not None else True
+    )
+    db.add(config)
+    await db.flush()
+    await db.commit()
+    await db.refresh(config)
+    return config.to_dict()
+
+@app.get("/api/v1/alerts/{alert_id}", response_model=AlertConfigResponse)
+async def get_alert(
+    alert_id: UUID,
+    tenant_id: str = Depends(get_tenant_from_auth),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Retrieve details of a single alert configuration.
+    """
+    stmt = select(AlertConfig).where(AlertConfig.id == alert_id)
+    if settings.api_key_tenants:
+        stmt = stmt.where(AlertConfig.tenant_id == tenant_id)
+    result = await db.execute(stmt)
+    config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(status_code=404, detail="Alert configuration not found")
+    return config.to_dict()
+
+@app.put("/api/v1/alerts/{alert_id}", response_model=AlertConfigResponse)
+async def update_alert(
+    alert_id: UUID,
+    config_in: AlertConfigUpdate,
+    tenant_id: str = Depends(get_tenant_from_auth),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Update details of an existing alert configuration.
+    Handles credential masking to prevent overwriting keys with placeholder text.
+    """
+    stmt = select(AlertConfig).where(AlertConfig.id == alert_id)
+    if settings.api_key_tenants:
+        stmt = stmt.where(AlertConfig.tenant_id == tenant_id)
+    result = await db.execute(stmt)
+    config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(status_code=404, detail="Alert configuration not found")
+    
+    if config_in.name is not None:
+        config.name = config_in.name
+    if config_in.config is not None:
+        new_config = {**config_in.config}
+        existing_config = config.config or {}
+        
+        # Prevent placeholder strings from overwriting real secrets
+        for sensitive_key in ("password", "smtp_password"):
+            if new_config.get(sensitive_key) == "••••••••" and sensitive_key in existing_config:
+                new_config[sensitive_key] = existing_config[sensitive_key]
+        
+        if "webhook_url" in new_config and new_config["webhook_url"].startswith("…") and "webhook_url" in existing_config:
+            new_config["webhook_url"] = existing_config["webhook_url"]
+            
+        config.config = new_config
+
+    if config_in.enabled is not None:
+        config.enabled = config_in.enabled
+    
+    config.updated_at = func.now()
+    await db.commit()
+    await db.refresh(config)
+    return config.to_dict()
+
+@app.delete("/api/v1/alerts/{alert_id}")
+async def delete_alert(
+    alert_id: UUID,
+    tenant_id: str = Depends(get_tenant_from_auth),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Delete an alert configuration.
+    """
+    stmt = select(AlertConfig).where(AlertConfig.id == alert_id)
+    if settings.api_key_tenants:
+        stmt = stmt.where(AlertConfig.tenant_id == tenant_id)
+    result = await db.execute(stmt)
+    config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(status_code=404, detail="Alert configuration not found")
+    
+    await db.delete(config)
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+@app.post("/api/v1/alerts/{alert_id}/test")
+async def test_alert(
+    alert_id: UUID,
+    tenant_id: str = Depends(get_tenant_from_auth),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Send a dummy DLQ alert immediately using the specified configuration to verify connection credentials.
+    """
+    stmt = select(AlertConfig).where(AlertConfig.id == alert_id)
+    if settings.api_key_tenants:
+        stmt = stmt.where(AlertConfig.tenant_id == tenant_id)
+    result = await db.execute(stmt)
+    config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(status_code=404, detail="Alert configuration not found")
+    
+    # Generate dummy test data
+    test_data = {
+        "webhook_id": "00000000-0000-0000-0000-000000000000",
+        "event_id": "evt_test_123456",
+        "destination_url": "https://example.com/webhook-receiver",
+        "retry_count": 5,
+        "last_error": "HTTP Error Status 500: Internal Server Error",
+        "tenant_id": tenant_id,
+    }
+    
+    try:
+        if config.channel_type == "slack":
+            await _send_slack_alert(config, test_data)
+        elif config.channel_type == "email":
+            await _send_email_alert(config, test_data)
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported channel type: {config.channel_type}")
+    except Exception as e:
+        logger.error(f"Test alert failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to send test alert: {str(e)}")
+        
+    return {"success": True, "message": f"Test alert successfully sent to {config.name}."}
+
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    return {"status": "healthy", "version": "1.0.0"}
+
+@app.get("/health/detailed")
+async def detailed_health_check(db: AsyncSession = Depends(get_db)):
+    """Detailed health check including database connectivity."""
+    try:
+        # Check database connection
+        await db.execute(select(func.count()))
+        db_status = "healthy"
+    except Exception:
+        db_status = "unhealthy"
+    
+    return {
+        "status": "healthy" if db_status == "healthy" else "degraded",
+        "version": "1.0.0",
+        "components": {
+            "database": db_status,
+            "api": "healthy"
+        }
+    }
+
+
+# Auth endpoints
+@app.post("/api/v1/auth/register", status_code=status.HTTP_201_CREATED)
+async def register(
+    email: str = Body(..., embed=True),
+    password: str = Body(..., embed=True),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Register a new user account.
+    """
+    # Check if user already exists
+    existing_result = await db.execute(select(User).where(User.email == email))
+    if existing_result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # Create new user
+    user = User(
+        email=email,
+        password_hash=get_password_hash(password)
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    
+    logger.info(
+        "User registered",
+        extra={"event": "user.registered", "user_id": str(user.id), "email": email}
+    )
+    
+    return {"message": "User registered successfully", "user_id": str(user.id)}
+
+
+@app.post("/api/v1/auth/login")
+async def login(
+    email: str = Body(..., embed=True),
+    password: str = Body(..., embed=True),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Login and receive a JWT access token.
+    """
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalar_one_or_none()
+    
+    if not user or not verify_password(password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password"
+        )
+    
+    access_token = create_access_token(data={"sub": str(user.id)})
+    
+    logger.info(
+        "User logged in",
+        extra={"event": "user.login", "user_id": str(user.id), "email": email}
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": user.to_dict()
+    }
+
+
+@app.get("/api/v1/auth/me")
+async def get_me(current_user: User = Depends(get_current_user)):
+    """
+    Get current user information.
+    """
+    return current_user.to_dict()
+
+
+# Project endpoints
+@app.get("/api/v1/projects", response_model=List[Dict[str, Any]])
+async def list_projects(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    List all projects the current user has access to.
+    """
+    result = await db.execute(
+        select(Project)
+        .join(ProjectMember, ProjectMember.project_id == Project.id)
+        .where(ProjectMember.user_id == current_user.id)
+        .order_by(Project.created_at.desc())
+    )
+    projects = result.scalars().all()
+    
+    # Add user's role for each project
+    projects_with_role = []
+    for project in projects:
+        member_result = await db.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == project.id,
+                ProjectMember.user_id == current_user.id
+            )
+        )
+        member = member_result.scalar_one_or_none()
+        project_dict = project.to_dict()
+        project_dict["role"] = member.role if member else None
+        projects_with_role.append(project_dict)
+    
+    return projects_with_role
+
+
+@app.post("/api/v1/projects", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
+async def create_project(
+    name: str = Body(..., embed=True),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Create a new project and add the current user as owner.
+    """
+    import uuid
+    
+    project = Project(
+        name=name,
+        api_key=f"hk_live_{uuid.uuid4().hex}"
+    )
+    db.add(project)
+    await db.flush()
+    
+    # Add user as owner
+    member = ProjectMember(
+        project_id=project.id,
+        user_id=current_user.id,
+        role="owner"
+    )
+    db.add(member)
+    
+    await db.commit()
+    await db.refresh(project)
+    
+    logger.info(
+        "Project created",
+        extra={"event": "project.created", "project_id": str(project.id), "user_id": str(current_user.id)}
+    )
+    
+    project_dict = project.to_dict()
+    project_dict["role"] = "owner"
+    return project_dict
+
+
+@app.get("/api/v1/projects/{project_id}", response_model=Dict[str, Any])
+async def get_project(
+    project_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get details of a specific project.
+    """
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+    
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found"
+        )
+    
+    # Verify user has access
+    member_result = await db.execute(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == current_user.id
+        )
+    )
+    member = member_result.scalar_one_or_none()
+    if not member:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this project"
+        )
+    
+    project_dict = project.to_dict()
+    project_dict["role"] = member.role
+    return project_dict
+
+
+@app.put("/api/v1/projects/{project_id}", response_model=Dict[str, Any])
+async def update_project(
+    project_id: UUID,
+    name: Optional[str] = Body(None, embed=True),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Update project details (owner/admin only).
+    """
+    require_owner_admin = require_project_role(required_roles=["owner", "admin"])
+    member = await require_owner_admin(project_id=project_id, current_user=current_user, db=db)
+    
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+    
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found"
+        )
+    
+    if name is not None:
+        project.name = name
+    
+    await db.commit()
+    await db.refresh(project)
+    
+    project_dict = project.to_dict()
+    project_dict["role"] = member.role
+    return project_dict
+
+
+@app.delete("/api/v1/projects/{project_id}")
+async def delete_project(
+    project_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Delete a project (owner only).
+    """
+    require_owner = require_project_role(required_roles=["owner"])
+    await require_owner(project_id=project_id, current_user=current_user, db=db)
+    
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+    
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found"
+        )
+    
+    await db.delete(project)
+    await db.commit()
+    
+    logger.info(
+        "Project deleted",
+        extra={"event": "project.deleted", "project_id": str(project_id), "user_id": str(current_user.id)}
+    )
+    
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# Team member endpoints
+@app.get("/api/v1/projects/{project_id}/members", response_model=List[Dict[str, Any]])
+async def list_project_members(
+    project_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    List all members of a project.
+    """
+    # Verify user has access
+    member_result = await db.execute(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == current_user.id
+        )
+    )
+    if not member_result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this project"
+        )
+    
+    result = await db.execute(
+        select(ProjectMember).where(ProjectMember.project_id == project_id)
+    )
+    members = result.scalars().all()
+    
+    return [m.to_dict() for m in members]
+
+
+@app.post("/api/v1/projects/{project_id}/members", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
+async def add_project_member(
+    project_id: UUID,
+    email: str = Body(..., embed=True),
+    role: str = Body("viewer", embed=True),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Add a member to a project (owner/admin only).
+    """
+    if role not in ["owner", "admin", "viewer"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Role must be one of: owner, admin, viewer"
+        )
+    
+    require_owner_admin = require_project_role(required_roles=["owner", "admin"])
+    await require_owner_admin(project_id=project_id, current_user=current_user, db=db)
+    
+    # Find user by email
+    user_result = await db.execute(select(User).where(User.email == email))
+    user = user_result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found. Ask them to register first."
+        )
+    
+    # Check if already a member
+    existing_result = await db.execute(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == user.id
+        )
+    )
+    if existing_result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User is already a member of this project"
+        )
+    
+    # Add member
+    member = ProjectMember(
+        project_id=project_id,
+        user_id=user.id,
+        role=role
+    )
+    db.add(member)
+    await db.commit()
+    await db.refresh(member)
+    
+    logger.info(
+        "Project member added",
+        extra={"event": "project.member_added", "project_id": str(project_id), "user_id": str(user.id), "role": role}
+    )
+    
+    return member.to_dict()
+
+
+@app.put("/api/v1/projects/{project_id}/members/{user_id}", response_model=Dict[str, Any])
+async def update_project_member_role(
+    project_id: UUID,
+    user_id: UUID,
+    role: str = Body(..., embed=True),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Update a member's role (owner only).
+    """
+    if role not in ["owner", "admin", "viewer"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Role must be one of: owner, admin, viewer"
+        )
+    
+    require_owner = require_project_role(required_roles=["owner"])
+    await require_owner(project_id=project_id, current_user=current_user, db=db)
+    
+    result = await db.execute(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == user_id
+        )
+    )
+    member = result.scalar_one_or_none()
+    
+    if not member:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Member not found"
+        )
+    
+    # Prevent removing the last owner
+    if member.role == "owner" and role != "owner":
+        owner_count_result = await db.execute(
+            select(func.count(ProjectMember.id)).where(
+                ProjectMember.project_id == project_id,
+                ProjectMember.role == "owner"
+            )
+        )
+        owner_count = owner_count_result.scalar()
+        if owner_count <= 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot remove the last owner from a project"
+            )
+    
+    member.role = role
+    await db.commit()
+    await db.refresh(member)
+    
+    logger.info(
+        "Project member role updated",
+        extra={"event": "project.member_role_updated", "project_id": str(project_id), "user_id": str(user_id), "role": role}
+    )
+    
+    return member.to_dict()
+
+
+@app.delete("/api/v1/projects/{project_id}/members/{user_id}")
+async def remove_project_member(
+    project_id: UUID,
+    user_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Remove a member from a project (owner only).
+    """
+    require_owner = require_project_role(required_roles=["owner"])
+    await require_owner(project_id=project_id, current_user=current_user, db=db)
+    
+    result = await db.execute(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == user_id
+        )
+    )
+    member = result.scalar_one_or_none()
+    
+    if not member:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Member not found"
+        )
+    
+    # Prevent removing the last owner
+    if member.role == "owner":
+        owner_count_result = await db.execute(
+            select(func.count(ProjectMember.id)).where(
+                ProjectMember.project_id == project_id,
+                ProjectMember.role == "owner"
+            )
+        )
+        owner_count = owner_count_result.scalar()
+        if owner_count <= 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot remove the last owner from a project"
+            )
+    
+    await db.delete(member)
+    await db.commit()
+    
+    logger.info(
+        "Project member removed",
+        extra={"event": "project.member_removed", "project_id": str(project_id), "user_id": str(user_id)}
+    )
+    
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 # Mount static frontend files path-safely
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))

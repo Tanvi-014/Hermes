@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     GITHUB_WEBHOOK_SECRET: str = ""
     HERMES_WEBHOOK_SECRET: str = ""
     SIGNATURE_TOLERANCE_SECONDS: int = 300
+    
+    # JWT Authentication settings
+    JWT_SECRET: str = "change-this-secret-in-production"
+    JWT_ALGORITHM: str = "HS256"
+
+    # Production settings
+    FORCE_HTTPS: bool = False
+    RATE_LIMIT_PER_MINUTE: int = 60
 
     # Schema management
     AUTO_CREATE_TABLES: bool = True

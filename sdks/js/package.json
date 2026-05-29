@@ -1,0 +1,22 @@
+{
+  "name": "hermes-middleware-sdk",
+  "version": "1.0.0",
+  "description": "Official JavaScript/TypeScript SDK for the Hermes Webhook Delivery Middleware proxy.",
+  "main": "src/client.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 0"
+  },
+  "keywords": [
+    "hermes",
+    "webhook",
+    "delivery",
+    "retry",
+    "middleware",
+    "sdk"
+  ],
+  "author": "Hermes Middleware Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

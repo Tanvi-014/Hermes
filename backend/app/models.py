@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime, timezone
 import uuid
-from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Text, Index
+from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Text, Index, Boolean
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -89,3 +89,111 @@ class DeliveryAttempt(Base):
     __table_args__ = (
         Index("ix_delivery_attempts_webhook_id_attempt_number", "webhook_id", "attempt_number"),
     )
+
+
+class AlertChannelType(str, enum.Enum):
+    SLACK = "slack"
+    EMAIL = "email"
+
+
+class AlertConfig(Base):
+    """
+    Stores alert destinations per tenant. When a webhook enters the DLQ,
+    Hermes fires notifications to every enabled AlertConfig for that tenant.
+    """
+    __tablename__ = "alert_configs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(String, nullable=False, default="anonymous")
+    name = Column(String, nullable=False)  # Human-readable label, e.g. "#ops-alerts"
+    channel_type = Column(String, nullable=False)  # "slack" or "email"
+    config = Column(JSONB, nullable=False)
+    # Slack config:  {"webhook_url": "https://hooks.slack.com/services/..."}
+    # Email config:  {"smtp_host": "...", "smtp_port": 587, "username": "...", "password": "...", "from": "...", "to": "dev@company.com"}
+    enabled = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self):
+        # Redact sensitive fields in config before sending to frontend
+        safe_config = {**self.config} if self.config else {}
+        for sensitive_key in ("password", "smtp_password"):
+            if sensitive_key in safe_config:
+                safe_config[sensitive_key] = "••••••••"
+        # Show only last 20 chars of webhook URLs
+        if "webhook_url" in safe_config and len(safe_config["webhook_url"]) > 20:
+            safe_config["webhook_url"] = "…" + safe_config["webhook_url"][-20:]
+
+        return {
+            "id": str(self.id),
+            "tenant_id": self.tenant_id,
+            "name": self.name,
+            "channel_type": self.channel_type,
+            "config": safe_config,
+            "enabled": self.enabled,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+    __table_args__ = (
+        Index("ix_alert_configs_tenant_id", "tenant_id"),
+    )
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email = Column(String, unique=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    memberships = relationship("ProjectMember", back_populates="user", cascade="all, delete-orphan")
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "email": self.email,
+            "created_at": self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String, nullable=False)
+    api_key = Column(String, unique=True, nullable=False, default=lambda: f"hk_live_{uuid.uuid4().hex}")
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    members = relationship("ProjectMember", back_populates="project", cascade="all, delete-orphan")
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "name": self.name,
+            "api_key": self.api_key,
+            "created_at": self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class ProjectMember(Base):
+    __tablename__ = "project_members"
+
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    role = Column(String, nullable=False, default="viewer")  # "owner", "admin", "viewer"
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User", back_populates="memberships")
+    project = relationship("Project", back_populates="members")
+
+    def to_dict(self):
+        return {
+            "project_id": str(self.project_id),
+            "user_id": str(self.user_id),
+            "role": self.role,
+            "email": self.user.email if self.user else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None
+        }
+
