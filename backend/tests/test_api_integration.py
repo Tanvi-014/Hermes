@@ -14,17 +14,26 @@ DOWNSTREAM_OK = os.getenv("HERMES_TEST_DOWNSTREAM_OK", "http://downstream:9000/o
 DOWNSTREAM_FAIL = os.getenv("HERMES_TEST_DOWNSTREAM_FAIL", "http://downstream:9000/fail")
 
 _session_token = None
+_project_api_key = None
 
 
 def get_headers():
+    """JWT Bearer token for user-level endpoints."""
     if _session_token:
         return {"Authorization": f"Bearer {_session_token}", "Content-Type": "application/json"}
     return {"Content-Type": "application/json"}
 
 
+def get_project_headers():
+    """Project API key for project-scoped endpoints (destinations, event-types, ingest)."""
+    if _project_api_key:
+        return {"X-Hermes-API-Key": _project_api_key, "Content-Type": "application/json"}
+    return get_headers()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def setup_session():
-    global _session_token
+    global _session_token, _project_api_key
     email = f"itest_{uuid.uuid4().hex[:8]}@hermes.test"
     password = "IntegrationTest123!"
 
@@ -34,6 +43,15 @@ def setup_session():
     r = httpx.post(f"{BASE_URL}/api/v1/auth/login", json={"email": email, "password": password})
     assert r.status_code == 200
     _session_token = r.json()["access_token"]
+
+    # Create a project so project-scoped endpoints have a real project_id
+    r = httpx.post(
+        f"{BASE_URL}/api/v1/projects",
+        headers=get_headers(),
+        json={"name": f"itest-project-{uuid.uuid4().hex[:6]}"},
+    )
+    assert r.status_code == 201, f"Project creation failed: {r.text}"
+    _project_api_key = r.json()["api_key"]
 
 
 def test_health():
@@ -122,29 +140,29 @@ def test_simulate_providers():
 def test_destination_crud():
     r = httpx.post(
         f"{BASE_URL}/api/v1/destinations",
-        headers=get_headers(),
+        headers=get_project_headers(),
         json={"name": f"itest-{uuid.uuid4().hex[:6]}", "url": DOWNSTREAM_OK},
     )
     assert r.status_code == 201, r.text
     dest_id = r.json()["id"]
 
-    r = httpx.get(f"{BASE_URL}/api/v1/destinations/{dest_id}", headers=get_headers())
+    r = httpx.get(f"{BASE_URL}/api/v1/destinations/{dest_id}", headers=get_project_headers())
     assert r.status_code == 200
 
-    r = httpx.delete(f"{BASE_URL}/api/v1/destinations/{dest_id}", headers=get_headers())
+    r = httpx.delete(f"{BASE_URL}/api/v1/destinations/{dest_id}", headers=get_project_headers())
     assert r.status_code == 204
 
 
 def test_event_type_crud():
     r = httpx.post(
         f"{BASE_URL}/api/v1/event-types",
-        headers=get_headers(),
+        headers=get_project_headers(),
         json={"name": f"itest.event.{uuid.uuid4().hex[:6]}", "description": "test"},
     )
     assert r.status_code == 201, r.text
     et_id = r.json()["id"]
 
-    r = httpx.delete(f"{BASE_URL}/api/v1/event-types/{et_id}", headers=get_headers())
+    r = httpx.delete(f"{BASE_URL}/api/v1/event-types/{et_id}", headers=get_project_headers())
     assert r.status_code == 204
 
 
