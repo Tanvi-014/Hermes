@@ -209,5 +209,14 @@ async def get_tenant_from_auth(
                     if p:
                         return p.api_key
 
-    # Fall back to API key auth
+    # Check if X-Hermes-API-Key is a real project api_key in the database.
+    # This path is used by programmatic clients (SDKs, curl) that pass the
+    # project key directly without going through HERMES_API_KEYS config.
+    header_key = request.headers.get("X-Hermes-API-Key", "")
+    if header_key:
+        pr = await db.execute(select(Project).where(Project.api_key == header_key))
+        if pr.scalar_one_or_none():
+            return header_key  # valid project key — use it as tenant_id directly
+
+    # Fall back to legacy pre-shared key config (HERMES_API_KEYS env var)
     return await require_api_key(request)
