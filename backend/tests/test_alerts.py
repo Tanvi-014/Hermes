@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from app.models import AlertConfig
 from app.schemas import AlertConfigCreate, AlertConfigUpdate
-from app.main import (
+from app.api_main import (
     list_alerts,
     create_alert,
     get_alert,
@@ -47,7 +47,7 @@ async def test_create_alert_config():
         enabled=True
     )
     
-    with patch("app.main.AlertConfig") as mock_alert_class:
+    with patch("app.api_main.AlertConfig") as mock_alert_class:
         mock_alert_instance = MagicMock()
         mock_alert_instance.to_dict.return_value = {
             "id": "mock-uuid",
@@ -100,7 +100,7 @@ async def test_update_alert_config_prevents_secret_overwrite():
         enabled=False
     )
     
-    with patch("app.main.func") as mock_func:
+    with patch("app.api_main.func") as mock_func:
         mock_func.now.return_value = None
         result = await update_alert(alert_id=alert_id, config_in=config_update, tenant_id="test_tenant", db=mock_db)
         
@@ -126,7 +126,7 @@ async def test_delete_alert_config():
     mock_db.commit.assert_called_once()
 
 @pytest.mark.anyio
-@patch("app.main._send_slack_alert")
+@patch("app.api_main._send_slack_alert")
 async def test_test_alert_endpoint(mock_send_slack):
     mock_db = AsyncMock()
     alert_id = uuid4()
